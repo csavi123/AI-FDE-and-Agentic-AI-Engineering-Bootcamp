@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: ask-claude
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    # --proxy-headers so the rate limit sees each caller's real IP, not Render's proxy.
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT --proxy-headers --forwarded-allow-ips='*'
+    envVars:
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: APP_TOKEN
+        sync: false
