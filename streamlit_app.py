@@ -1,5 +1,7 @@
 import html
+import json
 import os
+import threading
 
 import requests
 import streamlit as st
@@ -78,6 +80,14 @@ st.markdown(
         padding: 1.25rem 1.5rem; margin-top: 1rem; color: #E5E7EB; line-height: 1.6;
         box-shadow: 0 10px 40px rgba(0, 0, 0, 0.2);
       }
+      .muted { color: #9CA3AF; }
+      .cursor { color: #9B87F5; animation: blink 1s steps(1) infinite; }
+      @keyframes blink { 50% { opacity: 0; } }
+      .note {
+        margin-top: 0.9rem; padding: 0.7rem 1.1rem; border-radius: 16px;
+        background: rgba(31, 32, 35, 0.85); border: 1px solid #444444;
+        color: #D1D5DB; font-size: 0.9rem; line-height: 1.5;
+      }
       .label { color: #9CA3AF; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.06em; }
       .stats { display: flex; gap: 0.75rem; margin-top: 0.75rem; }
       .stat {
@@ -105,44 +115,118 @@ with st.form("ask_form", clear_on_submit=False, border=False):
     )
     submitted = right.form_submit_button("↑", help="Send")
 
+
+def server_is_awake() -> bool:
+    try:
+        return requests.get(f"{API_URL}/", timeout=2).ok
+    except requests.RequestException:
+        return False
+
+
+def wake_server() -> None:
+    """Any request wakes a sleeping Render instance; this one just waits for it to come up."""
+    try:
+        requests.get(f"{API_URL}/", timeout=90)
+    except requests.RequestException:
+        pass
+
+
+# Render's free plan sleeps after 15 idle minutes. Start waking it as soon as the page
+# opens, so it's warming up while the user types.
+awake = server_is_awake()
+if awake:
+    st.session_state.wake_started = False
+elif not st.session_state.get("wake_started"):
+    st.session_state.wake_started = True
+    threading.Thread(target=wake_server, daemon=True).start()
+
+
+def as_html(text: str) -> str:
+    return html.escape(text).replace("\n", "<br>")
+
+
+def answer_card(body_html: str) -> str:
+    return f'<div class="answer-card"><div class="label">answer</div><div>{body_html}</div></div>'
+
+
+def stats_row(data: dict) -> str:
+    return (
+        '<div class="stats">'
+        f'<div class="stat"><div class="label">tokens_used</div>{data["tokens_used"]:,}</div>'
+        f'<div class="stat"><div class="label">cost_usd</div>${data["cost_usd"]:.6f}</div>'
+        "</div>"
+    )
+
+
+def error_detail(resp: requests.Response):
+    try:
+        body = resp.json()
+        return body.get("detail") or body.get("error") or body
+    except ValueError:
+        return resp.text
+
+
+def sse_events(resp: requests.Response):
+    """Yield (event, data) pairs from a server-sent-events response as they arrive."""
+    event = None
+    for line in resp.iter_lines(chunk_size=None, decode_unicode=True):
+        if line.startswith("event: "):
+            event = line[len("event: "):]
+        elif line.startswith("data: "):
+            yield event, json.loads(line[len("data: "):])
+
+
+if not submitted and not awake:
+    st.markdown(
+        '<div class="note">☕ <b>Waking up the server…</b> It sleeps after 15 minutes without use '
+        "(free hosting), so your first answer may take up to a minute. You can type your question now.</div>",
+        unsafe_allow_html=True,
+    )
+
 if submitted:
     if not question.strip():
         st.warning("Type a question first.")
     elif not APP_TOKEN:
         st.error("APP_TOKEN is not set in .env.")
     else:
-        with st.spinner("Thinking..."):
-            try:
-                resp = requests.post(
-                    f"{API_URL}/ask",
-                    json={"question": question, "force_bad": force_bad},
-                    headers={"X-App-Token": APP_TOKEN},
-                    timeout=90,
-                )
-            except requests.RequestException:
-                st.error(f"Could not reach the API at {API_URL}. Is it running?")
-                st.stop()
+        output = st.empty()
+        waiting = "Thinking…" if awake else "☕ Waking up the server, this can take up to a minute…"
+        output.markdown(answer_card(f'<span class="muted">{waiting}</span>'), unsafe_allow_html=True)
+        finished = False
+        try:
+            with requests.post(
+                f"{API_URL}/ask/stream",
+                json={"question": question, "force_bad": force_bad},
+                headers={"X-App-Token": APP_TOKEN},
+                stream=True,
+                timeout=(10, 120),  # (connect, wait between chunks): covers a cold start
+            ) as resp:
+                if not resp.ok:
+                    output.empty()
+                    st.error(f"API returned {resp.status_code}: {error_detail(resp)}")
+                    st.stop()
 
-        if resp.ok:
-            data = resp.json()
-            answer = html.escape(data["answer"]).replace("\n", "<br>")
-            st.markdown(
-                f"""
-                <div class="answer-card">
-                  <div class="label">answer</div>
-                  <div>{answer}</div>
-                </div>
-                <div class="stats">
-                  <div class="stat"><div class="label">tokens_used</div>{data["tokens_used"]:,}</div>
-                  <div class="stat"><div class="label">cost_usd</div>${data["cost_usd"]:.6f}</div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-        else:
-            try:
-                body = resp.json()
-                detail = body.get("detail") or body.get("error") or body
-            except ValueError:
-                detail = resp.text
-            st.error(f"API returned {resp.status_code}: {detail}")
+                resp.encoding = "utf-8"
+                text = ""
+                for event, data in sse_events(resp):
+                    if event == "delta":
+                        text += data["text"]
+                        output.markdown(answer_card(as_html(text) + '<span class="cursor">▍</span>'),
+                                        unsafe_allow_html=True)
+                    elif event == "done":
+                        output.markdown(answer_card(as_html(data["answer"])) + stats_row(data),
+                                        unsafe_allow_html=True)
+                        finished = True
+                    elif event == "error":
+                        # The guardrail rejected the full reply: remove any text already shown.
+                        output.empty()
+                        st.error(f"API returned {data['status']}: {data['detail']}")
+                        finished = True
+        except requests.RequestException:
+            output.empty()
+            st.error(f"Could not reach the API at {API_URL}. Is it running?")
+            st.stop()
+
+        if not finished:
+            output.empty()
+            st.error("The answer was cut off before it finished. Please try again.")

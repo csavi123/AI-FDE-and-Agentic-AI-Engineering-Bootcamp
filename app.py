@@ -1,12 +1,15 @@
+import json
 import logging
 import os
 import re
 import secrets
+from contextlib import contextmanager
 from typing import Optional
 
 import anthropic
 from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
@@ -39,6 +42,8 @@ FORCE_BAD_INSTRUCTION = (
     'or using the key "respuesta" instead of "answer".'
 )
 CODE_FENCE = re.compile(r"^```(?:json)?\s*(.*?)\s*```$", re.DOTALL)
+# Where the answer's string value begins in a reply like {"answer": "...
+ANSWER_START = re.compile(r'^\s*(?:```(?:json)?\s*)?\{\s*"answer"\s*:\s*"')
 
 limiter = Limiter(key_func=get_remote_address)
 app = FastAPI(title="Ask Claude")
@@ -82,30 +87,51 @@ def parse_model_output(text: str) -> str:
         raise HTTPException(status_code=502, detail="Model returned malformed output.")
 
 
-@app.get("/")
-def health():
-    return {"status": "ok"}
+def partial_answer(raw: str) -> str:
+    """Decode as much of the "answer" string as has arrived so far in a streaming JSON reply.
+
+    Display only: the full reply is still validated by parse_model_output() once it's complete.
+    """
+    start = ANSWER_START.match(raw)
+    if not start:
+        return ""
+    body = raw[start.end():]
+    i = 0
+    while i < len(body):
+        if body[i] == '"':  # unescaped quote: the string is complete
+            break
+        if body[i] == "\\":
+            # Stop before an escape sequence that hasn't fully arrived yet.
+            length = 6 if body[i + 1:i + 2] == "u" else 2
+            if body[i + 1:i + 2] == "u" and re.fullmatch(r"\\u[dD][89abAB][0-9a-fA-F]{2}", body[i:i + 6]):
+                length = 12  # a high surrogate needs its low half before it can be decoded
+            if i + length > len(body):
+                break
+            i += length
+            continue
+        i += 1
+    try:
+        return json.loads(f'"{body[:i]}"')
+    except ValueError:
+        return ""
 
 
-@app.post("/ask", response_model=AskResponse)
-@limiter.limit(RATE_LIMIT)
-def ask(request: Request, req: AskRequest, x_app_token: Optional[str] = Header(None)):
-    # Checked after the rate limit, so wrong-token guessing is throttled too.
+def check_access(x_app_token: Optional[str], force_bad: bool) -> None:
     if x_app_token is None or not secrets.compare_digest(x_app_token, APP_TOKEN):
         raise HTTPException(status_code=401, detail="Unauthorized")
-
-    if req.force_bad and not ALLOW_FORCE_BAD:
+    if force_bad and not ALLOW_FORCE_BAD:
         raise HTTPException(status_code=403, detail="force_bad is disabled on this server.")
 
-    system = SYSTEM_PROMPT + ("\n\n" + FORCE_BAD_INSTRUCTION if req.force_bad else "")
 
+def system_prompt(force_bad: bool) -> str:
+    return SYSTEM_PROMPT + ("\n\n" + FORCE_BAD_INSTRUCTION if force_bad else "")
+
+
+@contextmanager
+def upstream_errors():
+    """Translate Anthropic SDK errors into HTTP errors for our callers."""
     try:
-        response = client.messages.create(
-            model=MODEL,
-            max_tokens=4096,
-            system=system,
-            messages=[{"role": "user", "content": req.question}],
-        )
+        yield
     except anthropic.AuthenticationError:
         raise HTTPException(status_code=500, detail="Server API key is invalid.")
     except anthropic.RateLimitError:
@@ -115,18 +141,97 @@ def ask(request: Request, req: AskRequest, x_app_token: Optional[str] = Header(N
     except anthropic.APIConnectionError:
         raise HTTPException(status_code=502, detail="Could not reach the model.")
 
-    if response.stop_reason == "refusal":
+
+def build_response(message) -> AskResponse:
+    """Apply the refusal check and output guardrail to a finished model message, then add cost."""
+    if message.stop_reason == "refusal":
         raise HTTPException(status_code=422, detail="The model declined this question.")
 
-    raw = "".join(b.text for b in response.content if b.type == "text")
+    raw = "".join(b.text for b in message.content if b.type == "text")
     answer = parse_model_output(raw)
 
-    input_tokens = response.usage.input_tokens
-    output_tokens = response.usage.output_tokens
+    input_tokens = message.usage.input_tokens
+    output_tokens = message.usage.output_tokens
     cost = (input_tokens * INPUT_PRICE_PER_MTOK + output_tokens * OUTPUT_PRICE_PER_MTOK) / 1_000_000
 
     return AskResponse(
         answer=answer,
         tokens_used=input_tokens + output_tokens,
         cost_usd=round(cost, 8),
+    )
+
+
+def sse(event: str, data: dict) -> str:
+    """Format one server-sent event."""
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
+@app.get("/")
+def health():
+    return {"status": "ok"}
+
+
+@app.post("/ask", response_model=AskResponse)
+@limiter.limit(RATE_LIMIT)
+def ask(request: Request, req: AskRequest, x_app_token: Optional[str] = Header(None)):
+    # Checked after the rate limit, so wrong-token guessing is throttled too.
+    check_access(x_app_token, req.force_bad)
+
+    with upstream_errors():
+        response = client.messages.create(
+            model=MODEL,
+            max_tokens=4096,
+            system=system_prompt(req.force_bad),
+            messages=[{"role": "user", "content": req.question}],
+        )
+    return build_response(response)
+
+
+@app.post("/ask/stream")
+@limiter.limit(RATE_LIMIT)
+def ask_stream(request: Request, req: AskRequest, x_app_token: Optional[str] = Header(None)):
+    """Same contract as /ask, delivered as server-sent events.
+
+    Events: "delta" {"text"} while the answer streams in, then exactly one of
+    "done" (the validated AskResponse) or "error" {"status", "detail"}.
+    A client must discard streamed text when it receives "error".
+    """
+    check_access(x_app_token, req.force_bad)
+
+    manager = client.messages.stream(
+        model=MODEL,
+        max_tokens=4096,
+        system=system_prompt(req.force_bad),
+        messages=[{"role": "user", "content": req.question}],
+    )
+    # Open the stream now, so auth/connection errors still become proper HTTP status codes.
+    with upstream_errors():
+        stream = manager.__enter__()
+
+    def events():
+        raw, sent = "", 0
+        try:
+            for text in stream.text_stream:
+                raw += text
+                answer = partial_answer(raw)
+                if len(answer) > sent:
+                    yield sse("delta", {"text": answer[sent:]})
+                    sent = len(answer)
+            final = stream.get_final_message()
+        except anthropic.APIError:
+            logger.warning("Model stream interrupted", exc_info=True)
+            yield sse("error", {"status": 502, "detail": "The model stream was interrupted."})
+            return
+        finally:
+            manager.__exit__(None, None, None)
+
+        try:
+            yield sse("done", build_response(final).model_dump())
+        except HTTPException as e:
+            yield sse("error", {"status": e.status_code, "detail": e.detail})
+
+    return StreamingResponse(
+        events(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )

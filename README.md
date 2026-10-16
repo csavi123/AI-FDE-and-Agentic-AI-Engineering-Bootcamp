@@ -26,7 +26,7 @@ Each secret lives in exactly one place. The browser never sees either one.
 
 | File | Purpose |
 |---|---|
-| `app.py` | FastAPI backend: `GET /` (health check) and `POST /ask` |
+| `app.py` | FastAPI backend: `GET /` (health check), `POST /ask` and `POST /ask/stream` |
 | `streamlit_app.py` | One-page UI that calls `/ask` from the server side |
 | `.streamlit/config.toml` | Dark theme for the UI |
 | `requirements.txt` | Python dependencies |
@@ -87,6 +87,8 @@ streamlit run streamlit_app.py
 
 Then open http://localhost:8501. Type a question and click **↑**, or press **⌘/Ctrl + Enter**.
 
+The UI uses `/ask/stream`, so the answer appears word by word. When the page opens, it checks whether the API is awake. If the API is asleep (Render's free plan sleeps after 15 idle minutes), the page shows a short "Waking up the server…" note and starts waking it in the background while you type.
+
 ## API reference
 
 ### `POST /ask`
@@ -111,6 +113,33 @@ Then open http://localhost:8501. Type a question and click **↑**, or press **�
 | `429` | Rate limit exceeded (10 requests per minute per IP), or Anthropic rate limit |
 | `500` | Server's Anthropic API key is invalid |
 | `502` | Anthropic API error or unreachable, or the model's reply broke the JSON contract (`"Model returned malformed output."`) |
+
+### `POST /ask/stream`
+
+Same headers, body and checks as `/ask`, but the answer is delivered as [server-sent events](https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events/Using_server-sent_events):
+
+```
+event: delta
+data: {"text": "RAG is "}
+
+event: delta
+data: {"text": "retrieval plus generation."}
+
+event: done
+data: {"answer": "RAG is retrieval plus generation.", "tokens_used": 113, "cost_usd": 0.000036}
+```
+
+- `delta` events carry the answer text as it is generated.
+- The stream always ends with exactly one `done` event (the validated `/ask` response) or one `error` event, such as `{"status": 502, "detail": "Model returned malformed output."}`.
+- The output guardrail can only validate the reply once it's complete. **When a client receives `error`, it must discard any text it has already shown.** The UI does this.
+- Errors that happen before streaming starts (401, 403, 422, 429, or failure to reach the model) are returned as normal HTTP errors, the same as `/ask`.
+
+```bash
+curl -N -X POST http://127.0.0.1:8000/ask/stream \
+  -H "X-App-Token: YOUR_APP_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"question":"What is RAG in one sentence?"}'
+```
 
 ### `GET /`
 
@@ -146,6 +175,7 @@ The tests in `tests/test_ask.py` replace Claude with a fake, so they need no API
 - **Output guardrail (502):** missing brace, wrong key, empty answer, extra field, or plain text from the model; code-fenced JSON is accepted
 - **`force_bad`:** refused with 403 when disabled; when enabled, the instruction is added and the broken reply is caught
 - **Health check:** works without a token
+- **Streaming:** deltas arrive first, then a validated `done`. Malformed, refused or interrupted streams end with an `error` event. Errors before streaming starts are plain HTTP errors. The incremental JSON decoder handles partial escapes and emoji.
 
 ## How cost is calculated
 
@@ -178,6 +208,6 @@ To point the local UI at the deployed API, set `API_URL=https://<your-service>.o
 
 - The rate limiter is in memory: it resets on restart and isn't shared across instances. Redis would fix this.
 - There's one shared token rather than per-user API keys or OAuth.
-- No streaming: the answer appears all at once.
+- With streaming, a malformed reply is visible for a moment before the UI removes it, because it can only be validated once complete.
 - No structured logging or metrics.
 - The UI is not deployed. It runs locally only.

@@ -1,4 +1,5 @@
 """Tests for POST /ask. Claude is replaced with a fake, so these never call Anthropic or cost money."""
+import json
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -194,3 +195,144 @@ def test_health_check_needs_no_token():
 
     assert r.status_code == 200
     assert r.json() == {"status": "ok"}
+
+
+# --- Streaming: POST /ask/stream ---------------------------------------------
+
+class FakeStream:
+    """Stand-in for the SDK's MessageStream: yields text chunks, then the final message."""
+    def __init__(self, chunks, final=None, error=None):
+        self._chunks, self._final, self._error = chunks, final, error
+
+    @property
+    def text_stream(self):
+        yield from self._chunks
+        if self._error:
+            raise self._error
+
+    def get_final_message(self):
+        return self._final
+
+
+class FakeStreamManager:
+    """Stand-in for client.messages.stream(...); opening it can raise like the real one."""
+    def __init__(self, stream=None, open_error=None):
+        self.stream, self.open_error, self.closed = stream, open_error, False
+
+    def __enter__(self):
+        if self.open_error:
+            raise self.open_error
+        return self.stream
+
+    def __exit__(self, *exc):
+        self.closed = True
+
+
+def stream_of(text, chunk_size=7, **final_kwargs):
+    chunks = [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
+    return FakeStreamManager(FakeStream(chunks, final=fake_message(text=text, **final_kwargs)))
+
+
+def sse_events(response):
+    """Parse a server-sent-events body into [(event, data), ...]."""
+    events = []
+    for block in response.text.strip().split("\n\n"):
+        lines = dict(line.split(": ", 1) for line in block.splitlines())
+        events.append((lines["event"], json.loads(lines["data"])))
+    return events
+
+
+def post_stream(body=None, headers=AUTH):
+    return client.post("/ask/stream", json=body or {"question": "What is RAG?"}, headers=headers)
+
+
+def test_stream_sends_deltas_then_validated_done():
+    reply = '{"answer": "RAG is \\"retrieval\\" plus generation."}'
+    manager = stream_of(reply, chunk_size=5)
+    with patch.object(app.client.messages, "stream", return_value=manager):
+        r = post_stream()
+
+    assert r.status_code == 200
+    assert r.headers["content-type"].startswith("text/event-stream")
+    events = sse_events(r)
+    deltas = "".join(d["text"] for e, d in events if e == "delta")
+    assert deltas == 'RAG is "retrieval" plus generation.'
+    assert events[-1] == ("done", {
+        "answer": 'RAG is "retrieval" plus generation.',
+        "tokens_used": 120,
+        "cost_usd": 0.000052,
+    })
+    assert manager.closed
+
+
+def test_stream_malformed_output_ends_with_error_event():
+    manager = stream_of('{"answer": "RAG is retrieval')  # never closed
+    with patch.object(app.client.messages, "stream", return_value=manager):
+        events = sse_events(post_stream())
+
+    assert events[-1] == ("error", {"status": 502, "detail": "Model returned malformed output."})
+    assert not any(e == "done" for e, _ in events)
+
+
+def test_stream_wrong_key_streams_nothing_and_errors():
+    with patch.object(app.client.messages, "stream", return_value=stream_of('{"respuesta": "hola"}')):
+        events = sse_events(post_stream())
+
+    assert events == [("error", {"status": 502, "detail": "Model returned malformed output."})]
+
+
+def test_stream_refusal_ends_with_422_event():
+    manager = stream_of("", stop_reason="refusal")
+    manager.stream._chunks = []
+    with patch.object(app.client.messages, "stream", return_value=manager):
+        events = sse_events(post_stream())
+
+    assert events == [("error", {"status": 422, "detail": "The model declined this question."})]
+
+
+def test_stream_interrupted_midway_ends_with_error_event():
+    broken = FakeStream(['{"answer": "RAG'], error=anthropic.APIConnectionError(request=ANTHROPIC_REQUEST))
+    manager = FakeStreamManager(broken)
+    with patch.object(app.client.messages, "stream", return_value=manager):
+        events = sse_events(post_stream())
+
+    assert events[-1] == ("error", {"status": 502, "detail": "The model stream was interrupted."})
+    assert manager.closed
+
+
+@pytest.mark.parametrize("error, expected_status", [
+    (api_error(anthropic.AuthenticationError, 401), 500),
+    (api_error(anthropic.RateLimitError, 429), 429),
+    (anthropic.APIConnectionError(request=ANTHROPIC_REQUEST), 502),
+])
+def test_stream_errors_when_opening_are_plain_http_errors(error, expected_status):
+    with patch.object(app.client.messages, "stream", return_value=FakeStreamManager(open_error=error)):
+        r = post_stream()
+
+    assert r.status_code == expected_status
+
+
+def test_stream_checks_token_and_input_before_calling_claude():
+    with patch.object(app.client.messages, "stream") as fake:
+        assert post_stream(headers={"X-App-Token": "wrong"}).status_code == 401
+        assert post_stream({"question": "   "}).status_code == 422
+        assert post_stream({"question": "hi", "force_bad": True}).status_code == 403
+    fake.assert_not_called()
+
+
+@pytest.mark.parametrize("raw, expected", [
+    ('', ''),
+    ('{"answ', ''),
+    ('{"answer": "', ''),
+    ('{"answer": "RAG is', 'RAG is'),
+    ('{"answer": "a \\', 'a '),                          # escape not finished yet
+    ('{"answer": "a \\"b\\" c', 'a "b" c'),
+    ('{"answer": "caf\\u00', 'caf'),                     # \u escape not finished yet
+    ('{"answer": "caf\\u00e9", "x', 'café'),
+    ('{"answer": "hi \\ud83d', 'hi '),                   # emoji: waiting for the low surrogate
+    ('{"answer": "hi \\ud83d\\ude00"}', 'hi 😀'),
+    ('```json\n{"answer": "fenced', 'fenced'),
+    ('{"respuesta": "hola"}', ''),
+])
+def test_partial_answer(raw, expected):
+    assert app.partial_answer(raw) == expected
