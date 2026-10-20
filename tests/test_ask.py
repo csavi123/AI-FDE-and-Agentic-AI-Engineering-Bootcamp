@@ -1,4 +1,7 @@
-"""Tests for POST /ask. Claude is replaced with a fake, so these never call Anthropic or cost money."""
+"""Tests for POST /ask. Claude and retrieval are replaced with fakes, so these never call Anthropic or Pinecone.
+
+Every test here retrieves the single CHUNK below with 0 embedding tokens; tests/test_ask_rag.py covers retrieval.
+"""
 import json
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -15,7 +18,11 @@ AUTH = {"X-App-Token": "test-token"}
 ANTHROPIC_REQUEST = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
 
 
-def fake_message(text='{"answer": "RAG retrieves documents and feeds them to the model."}',
+CHUNK = {"id": "POL-1#0", "score": 0.8, "text": "RAG retrieves documents and feeds them to the model.",
+         "document_id": "POL-1", "chunk_index": 0, "source": "rag.txt", "metadata": {}}
+
+
+def fake_message(text='{"answer": "RAG retrieves documents and feeds them to the model.", "citations": ["POL-1"]}',
                  input_tokens=20, output_tokens=100, stop_reason="end_turn"):
     """A stand-in for the object client.messages.create() returns."""
     return SimpleNamespace(
@@ -37,6 +44,11 @@ def reset_rate_limit():
     app.limiter.reset()
 
 
+@pytest.fixture(autouse=True)
+def fake_retrieval(monkeypatch):
+    monkeypatch.setattr(app.rag, "query", lambda question, top_k: ([CHUNK], 0))
+
+
 @pytest.fixture
 def fake_claude():
     with patch.object(app.client.messages, "create", return_value=fake_message()) as mock:
@@ -51,19 +63,23 @@ def test_returns_answer_tokens_and_cost(fake_claude):
     assert r.status_code == 200
     assert r.json() == {
         "answer": "RAG retrieves documents and feeds them to the model.",
+        "citations": ["POL-1"],
+        "retrieved_chunk_ids": ["POL-1#0"],
         "tokens_used": 120,
         "cost_usd": 0.000052,  # (20 * 0.10 + 100 * 0.50) / 1M
     }
     sent = fake_claude.call_args.kwargs
     assert sent["model"] == "claude-haiku-5-5"
-    assert sent["messages"] == [{"role": "user", "content": "What is RAG in one sentence?"}]
+    assert sent["messages"] == [
+        {"role": "user", "content": app.grounding_prompt("What is RAG in one sentence?", [CHUNK])},
+    ]
     assert sent["system"] == app.SYSTEM_PROMPT
 
 
 def test_question_is_trimmed_before_sending(fake_claude):
     client.post("/ask", json={"question": "  What is RAG?  "}, headers=AUTH)
 
-    assert fake_claude.call_args.kwargs["messages"][0]["content"] == "What is RAG?"
+    assert fake_claude.call_args.kwargs["messages"][0]["content"].endswith("\n\nQuestion: What is RAG?")
 
 
 # --- Validation: rejected with 422 before Claude is called -------------------
@@ -143,7 +159,8 @@ def test_upstream_errors_are_mapped(error, expected_status):
     '{"answer": "RAG is retrieval plus generation."',     # missing closing brace
     '{"respuesta": "RAG is retrieval plus generation."}',  # wrong key
     '{"answer": ""}',                                      # empty answer
-    '{"answer": "ok", "extra": 1}',                        # unexpected field
+    '{"answer": "ok", "citations": [], "extra": 1}',       # unexpected field
+    '{"answer": "ok"}',                                    # citations missing
     "RAG is retrieval plus generation.",                   # not JSON at all
 ])
 def test_malformed_model_output_returns_502(model_text):
@@ -155,7 +172,7 @@ def test_malformed_model_output_returns_502(model_text):
 
 
 def test_code_fenced_json_is_accepted():
-    fenced = '```json\n{"answer": "RAG is retrieval plus generation."}\n```'
+    fenced = '```json\n{"answer": "RAG is retrieval plus generation.", "citations": ["POL-1"]}\n```'
     with patch.object(app.client.messages, "create", return_value=fake_message(text=fenced)):
         r = client.post("/ask", json={"question": "hi"}, headers=AUTH)
 
@@ -247,7 +264,7 @@ def post_stream(body=None, headers=AUTH):
 
 
 def test_stream_sends_deltas_then_validated_done():
-    reply = '{"answer": "RAG is \\"retrieval\\" plus generation."}'
+    reply = '{"answer": "RAG is \\"retrieval\\" plus generation.", "citations": ["POL-1"]}'
     manager = stream_of(reply, chunk_size=5)
     with patch.object(app.client.messages, "stream", return_value=manager):
         r = post_stream()
@@ -259,6 +276,8 @@ def test_stream_sends_deltas_then_validated_done():
     assert deltas == 'RAG is "retrieval" plus generation.'
     assert events[-1] == ("done", {
         "answer": 'RAG is "retrieval" plus generation.',
+        "citations": ["POL-1"],
+        "retrieved_chunk_ids": ["POL-1#0"],
         "tokens_used": 120,
         "cost_usd": 0.000052,
     })
