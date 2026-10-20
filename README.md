@@ -45,6 +45,7 @@ Each secret lives in exactly one place. The browser never sees any of them.
 | `.streamlit/config.toml` | Dark theme for the UI |
 | `tests/` | pytest suite (`test_ask.py`, `test_ask_rag.py`, `test_ingest.py`, `test_retrieve.py`, `test_rag.py`) and shared fakes and test setup (`conftest.py`) |
 | `pytest.ini` | pytest settings |
+| `eval/` | Golden-set eval against the live API: questions and expected answers (`golden_set.json`) and the runner (`run_eval.py`) |
 | `requirements.txt` | Python dependencies |
 | `.env.example` | Template for local secrets (copy to `.env`) |
 | `Dockerfile`, `docker-compose.yml`, `.dockerignore` | Run the API and UI locally in containers |
@@ -371,6 +372,59 @@ The RAG tests use the fake Pinecone in `tests/conftest.py`:
 - **`tests/test_rag.py`:** ingest and search use the same embedding model, with `passage` and `query` input types; embedding batches stay in order; chunk text is stored in metadata; search results expose `document_id`, `chunk_index` and `source`; the embedding cost; and every `/debug/pinecone` outcome (ok, bad key, missing index, wrong dimension, missing setting, unreachable).
 - **`tests/test_ingest.py`:** short and long documents, chunk ids and metadata, configurable chunk size, re-ingesting a shorter version deletes leftover chunks, `400` for empty input, `422` for invalid input, `401` without a token, and Pinecone errors mapped to `500`, `429` and `502`. Bad requests never reach the embedding model.
 - **`tests/test_retrieve.py`:** ranked matches with scores and document ids, the question embedded as a query, `top_k` default and limits, bad parameters, auth, and that Claude is never called.
+
+## Golden-set eval
+
+The tests above use fakes. The golden-set eval does the opposite: it sends questions with known answers to the **running** service, with real Pinecone and real Claude, and checks what comes back.
+
+The questions live in `eval/golden_set.json`: seven answerable questions, one per indexed document, plus one question that **should be refused** because no document covers it. Each answerable question has an expected answer, the document that holds it, a phrase from the source text that marks the answer chunk, and the keywords a correct answer must contain.
+
+### Run it
+
+With the API running (`uvicorn app:app`) and the documents ingested:
+
+```bash
+python eval/run_eval.py                       # local API, or API_URL from .env
+python eval/run_eval.py --api-url https://<your-service>.onrender.com
+python eval/run_eval.py > eval/results.md     # save the table and review notes
+```
+
+It reads `APP_TOKEN` from `.env`. It makes two calls per question (`GET /debug/retrieve` and `POST /ask`) with a short pause between them to stay under the rate limit, so a run takes about two minutes and costs about $0.0015. It exits with `1` if any automatic check fails.
+
+### What is checked
+
+| Check | Automatic? | Passes when |
+|---|---|---|
+| **Retrieval hit** | yes | a chunk containing the answer phrase is among the 5 chunks `/ask` gave Claude |
+| **Cites expected doc** | yes | the expected `document_id` is in `citations` |
+| **Correct** | yes | the answer contains every required keyword (for example `14` and `90` for the password rule) and isn't a refusal |
+| **Refusal** | yes | the answer is exactly the refusal string, with no citations |
+| **Faithful** | **no, by hand** | every fact in the answer appears in the retrieved chunk text. The script prints each answer next to its answer chunk under "Faithfulness review" to make this quick |
+
+The answer chunk is found by its text, not a fixed chunk id, so the golden set stays valid if you change `CHUNK_SIZE` or `CHUNK_OVERLAP` and re-ingest.
+
+### Latest results
+
+Run on 2026-10-20 against the local API · Claude Haiku 5.5 · `llama-text-embed-v2` · top_k = 5 · chunks of 800 characters with 100 overlap. Faithfulness was checked by hand.
+
+| # | Question | Expected answer | Answer chunk | Rank | Retrieval hit (top-5) | Faithful | Correct | Notes |
+|---|---|---|---|---|---|---|---|---|
+| 1 | How many days per week can employees work remotely? | Up to 3 days | `POL-101#5` | 1 | ✅ | ✅ | ✅ | Matches the source sentence word for word. |
+| 2 | What is the mileage reimbursement rate? | 45p per mile, for travel over 50 miles | `POL-114#2`, `POL-114#3` | 1 | ✅ | ✅ | ✅ | The fact sits in the overlap, so two chunks hold it. The answer kept the "over 50 miles" condition. |
+| 3 | What are the password requirements? | At least 14 characters, rotated every 90 days | `POL-207#1` | 1 | ✅ | ✅ | ✅ | Also lists MFA, a password manager and no sharing. All of it is in `POL-207#1`, so it's longer than expected but still grounded. |
+| 4 | What is the payload capacity of the WB-9 robot? | 25 kg | `SPEC-WB9#1` | 1 | ✅ | ✅ | ✅ | |
+| 5 | How quickly must managers respond to access review tickets? | Within 10 working days | `POL-220#1` | 1 | ✅ | ✅ | ✅ | Comes from the smallest document (IT acceptable use). |
+| 6 | What are the Cambridge office opening hours? | 07:30–19:30 on weekdays | `POL-118#0` | 2 | ✅ | ✅ | ✅ | The handbook's working-hours chunk (`POL-101#5`, "09:00 to 17:30") ranked first. The model still picked the facilities guide, which is the right source. |
+| 7 | What is the most faithful animal? | Dogs | `doc_101#0` | 1 | ✅ | ✅ | ✅ | Off-topic test document. Its top score was 0.43 and the next was 0.09, a clear gap. |
+| 8 | **Refusal:** How many weeks of paid parental leave do employees get? | "I don't have enough information to answer that." | none (no document covers it) | n/a | n/a | ✅ | ✅ | Retrieved related handbook leave chunks (top score 0.38) but still refused, with `citations: []`. |
+
+**Score:** retrieval 7/7 · faithfulness 8/8 · correctness 8/8 · refusal 1/1
+
+Row 6 is the closest call: if you change chunking or `top_k`, check it first.
+
+### Add a question
+
+Add an entry to `eval/golden_set.json`. Copy `answer_phrase` exactly from the source document; whitespace and case don't matter. For a refusal question, set `expected_document`, `answer_phrase` and `answer_must_include` to `null`, `null` and `[]`.
 
 ## How cost is calculated
 

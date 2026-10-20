@@ -1,0 +1,66 @@
+[
+  {
+    "id": 1,
+    "question": "How many days per week can employees work remotely?",
+    "expected_answer": "Up to 3 days",
+    "expected_document": "POL-101",
+    "answer_phrase": "remotely up to three days per week",
+    "answer_must_include": [["three", "3"]]
+  },
+  {
+    "id": 2,
+    "question": "What is the mileage reimbursement rate?",
+    "expected_answer": "45p per mile, for travel over 50 miles",
+    "expected_document": "POL-114",
+    "answer_phrase": "45 pence per mile",
+    "answer_must_include": [["45"], ["50"]]
+  },
+  {
+    "id": 3,
+    "question": "What are the password requirements?",
+    "expected_answer": "At least 14 characters, rotated every 90 days",
+    "expected_document": "POL-207",
+    "answer_phrase": "at least 14 characters",
+    "answer_must_include": [["14"], ["90"]]
+  },
+  {
+    "id": 4,
+    "question": "What is the payload capacity of the WB-9 robot?",
+    "expected_answer": "25 kg",
+    "expected_document": "SPEC-WB9",
+    "answer_phrase": "payload capacity of 25 kg",
+    "answer_must_include": [["25"]]
+  },
+  {
+    "id": 5,
+    "question": "How quickly must managers respond to access review tickets?",
+    "expected_answer": "Within 10 working days",
+    "expected_document": "POL-220",
+    "answer_phrase": "ten working days",
+    "answer_must_include": [["ten", "10"]]
+  },
+  {
+    "id": 6,
+    "question": "What are the Cambridge office opening hours?",
+    "expected_answer": "07:30-19:30 on weekdays",
+    "expected_document": "POL-118",
+    "answer_phrase": "07:30 to 19:30",
+    "answer_must_include": [["07:30", "7:30"], ["19:30", "7:30 pm", "7:30pm"]]
+  },
+  {
+    "id": 7,
+    "question": "What is the most faithful animal?",
+    "expected_answer": "Dogs",
+    "expected_document": "doc_101",
+    "answer_phrase": "most faithful",
+    "answer_must_include": [["dog"]]
+  },
+  {
+    "id": 8,
+    "question": "How many weeks of paid parental leave do employees get?",
+    "expected_answer": "REFUSAL",
+    "expected_document": null,
+    "answer_phrase": null,
+    "answer_must_include": []
+  }
+]
