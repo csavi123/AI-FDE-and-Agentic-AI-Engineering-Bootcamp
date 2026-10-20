@@ -1,4 +1,6 @@
 anthropic==0.125.0
+pinecone==7.3.0
+langchain-text-splitters==0.3.11
 fastapi==0.128.8
 uvicorn[standard]==0.39.0
 python-dotenv==1.2.1

@@ -4,16 +4,20 @@ import os
 import re
 import secrets
 from contextlib import contextmanager
-from typing import Optional
+from typing import Dict, List, Optional, Union
 
 import anthropic
+import urllib3
 from dotenv import load_dotenv
-from fastapi import FastAPI, Header, HTTPException, Request
+from fastapi import FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pinecone.exceptions import PineconeApiException, PineconeException, UnauthorizedException
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
+
+import rag
 
 load_dotenv()
 logger = logging.getLogger("ask")
@@ -63,6 +67,37 @@ class AskRequest(BaseModel):
 
 class AskResponse(BaseModel):
     answer: str
+    tokens_used: int
+    cost_usd: float
+
+
+MetadataValue = Union[str, int, float, bool, List[str]]  # the value types Pinecone metadata accepts
+RESERVED_METADATA_KEYS = {"document_id", "chunk_index", "source", "text"}
+
+
+class IngestRequest(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    # Empty values pass validation here so ingest() can answer them with a 400.
+    # "#" is excluded because chunk ids are "<document_id>#<chunk_index>".
+    document_id: str = Field(..., max_length=200, pattern=r"^[A-Za-z0-9._:-]*$")
+    text: str = Field(..., max_length=500_000)
+    source: Optional[str] = Field(None, max_length=500)  # e.g. the file name; defaults to document_id
+    metadata: Dict[str, MetadataValue] = Field(default_factory=dict)
+
+    @field_validator("metadata")
+    @classmethod
+    def no_reserved_keys(cls, v: dict) -> dict:
+        clash = RESERVED_METADATA_KEYS & v.keys()
+        if clash:
+            raise ValueError(f"metadata cannot use reserved keys: {', '.join(sorted(clash))}")
+        return v
+
+
+class IngestResponse(BaseModel):
+    document_id: str
+    chunks_indexed: int
+    status: str
     tokens_used: int
     cost_usd: float
 
@@ -142,6 +177,25 @@ def upstream_errors():
         raise HTTPException(status_code=502, detail="Could not reach the model.")
 
 
+@contextmanager
+def rag_errors():
+    """Translate Pinecone errors (embedding and storage) into HTTP errors for our callers."""
+    try:
+        yield
+    except rag.VectorStoreError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except UnauthorizedException:
+        raise HTTPException(status_code=500, detail="Server Pinecone key is invalid.")
+    except PineconeApiException as e:
+        if e.status == 429:
+            raise HTTPException(status_code=429, detail="Pinecone rate limited, try again shortly.")
+        logger.warning("Pinecone request failed", exc_info=True)
+        raise HTTPException(status_code=502, detail="Vector store request failed.")
+    except (PineconeException, urllib3.exceptions.HTTPError):
+        logger.warning("Could not reach Pinecone", exc_info=True)
+        raise HTTPException(status_code=502, detail="Could not reach Pinecone.")
+
+
 def build_response(message) -> AskResponse:
     """Apply the refusal check and output guardrail to a finished model message, then add cost."""
     if message.stop_reason == "refusal":
@@ -169,6 +223,83 @@ def sse(event: str, data: dict) -> str:
 @app.get("/")
 def health():
     return {"status": "ok"}
+
+
+# Example:
+#   curl -G http://127.0.0.1:8000/debug/retrieve \
+#     -H "X-App-Token: $APP_TOKEN" \
+#     --data-urlencode "q=How many remote days are allowed?"
+@app.get("/debug/retrieve")
+@limiter.limit(RATE_LIMIT)
+def debug_retrieve(
+    request: Request,
+    q: str = Query(..., max_length=4000),
+    top_k: int = Query(5, ge=1, le=20),
+    x_app_token: Optional[str] = Header(None),
+):
+    """Show which chunks a question retrieves, with similarity scores. Never calls Claude."""
+    check_access(x_app_token, force_bad=False)
+    question = q.strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="q must not be empty.")
+
+    with rag_errors():
+        matches, tokens = rag.query(question, top_k=top_k)
+    return {
+        "query": question,
+        "top_k": top_k,
+        "matches": matches,
+        "tokens_used": tokens,
+        "cost_usd": round(rag.embedding_cost(tokens), 8),
+    }
+
+
+@app.get("/debug/pinecone")
+@limiter.limit(RATE_LIMIT)
+def debug_pinecone(request: Request, x_app_token: Optional[str] = Header(None)):
+    """Confirm Pinecone is reachable and the index fits the embedding model. Needs the app token."""
+    check_access(x_app_token, force_bad=False)
+    try:
+        return rag.pinecone_health()
+    except rag.VectorStoreError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception:
+        logger.warning("Pinecone health check failed", exc_info=True)
+        raise HTTPException(status_code=503, detail="Could not reach Pinecone.")
+
+
+# Example:
+#   curl -X POST http://127.0.0.1:8000/ingest \
+#     -H "Content-Type: application/json" \
+#     -H "X-App-Token: $APP_TOKEN" \
+#     -d '{"document_id": "refund-policy", "source": "refund_policy.md",
+#          "text": "Customers can request a refund within 30 days of purchase...",
+#          "metadata": {"department": "support"}}'
+#
+#   -> {"document_id": "refund-policy", "chunks_indexed": 1, "status": "indexed",
+#       "tokens_used": 12, "cost_usd": 1.92e-06}
+@app.post("/ingest", response_model=IngestResponse)
+@limiter.limit(RATE_LIMIT)
+def ingest(request: Request, req: IngestRequest, x_app_token: Optional[str] = Header(None)):
+    """Chunk a document, embed each chunk and store it in Pinecone.
+
+    Sending the same document_id again replaces that document's chunks.
+    """
+    check_access(x_app_token, force_bad=False)
+    if not req.document_id:
+        raise HTTPException(status_code=400, detail="document_id must not be empty.")
+    if not req.text:
+        raise HTTPException(status_code=400, detail="text must not be empty.")
+
+    with rag_errors():
+        chunks, tokens = rag.index_document(req.document_id, req.text, req.source or req.document_id, req.metadata)
+    return IngestResponse(
+        document_id=req.document_id,
+        chunks_indexed=chunks,
+        status="indexed",
+        tokens_used=tokens,
+        cost_usd=round(rag.embedding_cost(tokens), 8),
+    )
 
 
 @app.post("/ask", response_model=AskResponse)

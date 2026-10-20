@@ -10,3 +10,7 @@ services:
         sync: false
       - key: APP_TOKEN
         sync: false
+      - key: PINECONE_API_KEY
+        sync: false
+      - key: PINECONE_INDEX_NAME
+        sync: false
