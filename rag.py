@@ -26,6 +26,12 @@ EMBEDDING_DIMENSION = 1024  # the model's default size; the Pinecone index must 
 # allowance. Check pinecone.io/pricing for current numbers.
 EMBEDDING_PRICE_PER_MTOK = 0.16
 
+RERANK_MODEL = "bge-reranker-v2-m3"  # the only reranker on Pinecone's free Starter plan
+# USD per rerank request ($2 per 1,000) on paid plans; Starter includes 500 requests a month.
+# Check pinecone.io/pricing for current numbers.
+RERANK_PRICE_PER_REQUEST = 0.002
+RERANK_MAX_DOCUMENTS = 100  # the model accepts at most 100 documents per request
+
 EMBED_BATCH_SIZE = 96  # the model accepts at most 96 texts per request
 # Vectors per Pinecone upsert: 1024 floats each as JSON is ~14KB, and a request is capped at 2MB.
 UPSERT_BATCH_SIZE = 50
@@ -52,6 +58,13 @@ CHUNK_SIZE = _int_env("CHUNK_SIZE", 800)
 CHUNK_OVERLAP = _int_env("CHUNK_OVERLAP", 100)
 if CHUNK_SIZE <= 0 or not 0 <= CHUNK_OVERLAP < CHUNK_SIZE:
     raise ValueError(f"Need CHUNK_SIZE > 0 and 0 <= CHUNK_OVERLAP < CHUNK_SIZE, got {CHUNK_SIZE}/{CHUNK_OVERLAP}.")
+
+# Reranking, off unless RERANK=true. With it on, /ask fetches RERANK_CANDIDATES chunks by
+# vector similarity and the reranker picks the best of them. Read once at startup.
+RERANK = os.environ.get("RERANK", "").strip().lower() == "true"
+RERANK_CANDIDATES = _int_env("RERANK_CANDIDATES", 20)
+if not 1 <= RERANK_CANDIDATES <= RERANK_MAX_DOCUMENTS:
+    raise ValueError(f"Need 1 <= RERANK_CANDIDATES <= {RERANK_MAX_DOCUMENTS}, got {RERANK_CANDIDATES}.")
 
 
 @lru_cache(maxsize=1)
@@ -165,8 +178,39 @@ def query(question: str, top_k: int = 5, filter: Optional[dict] = None) -> Tuple
     return matches, tokens
 
 
+def rerank(question: str, matches: List[dict], top_n: int) -> Tuple[List[dict], int]:
+    """Reorder matches by how well each one answers the question, keep the best top_n,
+    and return them with the rerank units used.
+
+    Vector search compares the question and a chunk as two separate vectors; the reranker
+    reads them together, so it can tell a chunk that answers from one that is only on topic.
+    Each returned match keeps its cosine "score" and gains "rerank_score" (higher is more
+    relevant) and "vector_rank" (its 1-based position before reranking).
+    """
+    if not matches:
+        return [], 0
+    result = pinecone_client().inference.rerank(
+        model=RERANK_MODEL,
+        query=question,
+        documents=[{"id": m["id"], "text": m["text"]} for m in matches],
+        top_n=min(top_n, len(matches)),
+        return_documents=False,
+        parameters={"truncate": "END"},
+    )
+    reranked = [
+        {**matches[item["index"]], "rerank_score": item["score"], "vector_rank": item["index"] + 1}
+        for item in result.data
+    ]
+    return reranked, result.usage["rerank_units"]
+
+
 def embedding_cost(tokens: int) -> float:
     return tokens * EMBEDDING_PRICE_PER_MTOK / 1_000_000
+
+
+def rerank_cost(units: int) -> float:
+    # Pinecone bills bge-reranker-v2-m3 per request; one request reports one rerank unit.
+    return units * RERANK_PRICE_PER_REQUEST
 
 
 def pinecone_health() -> dict:

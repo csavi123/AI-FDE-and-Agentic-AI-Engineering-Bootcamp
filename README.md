@@ -414,7 +414,7 @@ Run on 2026-10-20 against the local API · Claude Haiku 5.5 · `llama-text-embed
 | 3 | What are the password requirements? | At least 14 characters, rotated every 90 days | `POL-207#1` | 1 | ✅ | ✅ | ✅ | Also lists MFA, a password manager and no sharing. All of it is in `POL-207#1`, so it's longer than expected but still grounded. |
 | 4 | What is the payload capacity of the WB-9 robot? | 25 kg | `SPEC-WB9#1` | 1 | ✅ | ✅ | ✅ | |
 | 5 | How quickly must managers respond to access review tickets? | Within 10 working days | `POL-220#1` | 1 | ✅ | ✅ | ✅ | Comes from the smallest document (IT acceptable use). |
-| 6 | What are the Cambridge office opening hours? | 07:30–19:30 on weekdays | `POL-118#0` | 2 | ✅ | ✅ | ✅ | The handbook's working-hours chunk (`POL-101#5`, "09:00 to 17:30") ranked first. The model still picked the facilities guide, which is the right source. |
+| 6 | What are the Cambridge office opening hours? | 07:30–19:30 on weekdays | `POL-118#0` | 2 | ✅ | ✅ | ✅ | The handbook's remote-work and desk-booking chunk (`POL-101#5`) ranked first: it mentions Cambridge twice and several times of day, but not opening hours. The model still picked the facilities guide, which is the right source. |
 | 7 | What is the most faithful animal? | Dogs | `doc_101#0` | 1 | ✅ | ✅ | ✅ | Off-topic test document. Its top score was 0.43 and the next was 0.09, a clear gap. |
 | 8 | **Refusal:** How many weeks of paid parental leave do employees get? | "I don't have enough information to answer that." | none (no document covers it) | n/a | n/a | ✅ | ✅ | Retrieved related handbook leave chunks (top score 0.38) but still refused, with `citations: []`. |
 

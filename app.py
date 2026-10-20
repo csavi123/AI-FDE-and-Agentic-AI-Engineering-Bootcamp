@@ -219,10 +219,28 @@ def rag_errors():
         raise HTTPException(status_code=502, detail="Could not reach Pinecone.")
 
 
-def retrieve(question: str) -> Tuple[List[dict], int]:
-    """The top RETRIEVAL_TOP_K chunks for a question, and the embedding tokens used."""
+def retrieve(question: str) -> Tuple[List[dict], int, int]:
+    """The top RETRIEVAL_TOP_K chunks for a question, the embedding tokens and the rerank units used.
+
+    With RERANK on, fetch RERANK_CANDIDATES chunks by vector similarity and let the reranker
+    pick the best RETRIEVAL_TOP_K. If the reranker fails (for example, the free monthly
+    allowance is used up), fall back to vector order so the question is still answered.
+    """
+    if not rag.RERANK:
+        with rag_errors():
+            chunks, tokens = rag.query(question, top_k=RETRIEVAL_TOP_K)
+        return chunks, tokens, 0
+
     with rag_errors():
-        return rag.query(question, top_k=RETRIEVAL_TOP_K)
+        candidates, tokens = rag.query(question, top_k=max(rag.RERANK_CANDIDATES, RETRIEVAL_TOP_K))
+    try:
+        chunks, units = rag.rerank(question, candidates, top_n=RETRIEVAL_TOP_K)
+    except (PineconeException, urllib3.exceptions.HTTPError):
+        logger.warning("Rerank failed, using vector order instead", exc_info=True)
+        return candidates[:RETRIEVAL_TOP_K], tokens, 0
+    logger.info("Reranked %d candidates; vector ranks of the chunks kept: %s",
+                len(candidates), [c["vector_rank"] for c in chunks])
+    return chunks, tokens, units
 
 
 def grounding_prompt(question: str, chunks: List[dict]) -> str:
@@ -243,7 +261,7 @@ def no_context_response(embedding_tokens: int) -> AskResponse:
     )
 
 
-def build_response(message, chunks: List[dict], embedding_tokens: int) -> AskResponse:
+def build_response(message, chunks: List[dict], embedding_tokens: int, rerank_units: int = 0) -> AskResponse:
     """Apply the refusal check and output guardrails to a finished model message, then add cost."""
     if message.stop_reason == "refusal":
         raise HTTPException(status_code=422, detail="The model declined this question.")
@@ -269,7 +287,7 @@ def build_response(message, chunks: List[dict], embedding_tokens: int) -> AskRes
         citations=citations,
         retrieved_chunk_ids=[c["id"] for c in chunks],
         tokens_used=input_tokens + output_tokens + embedding_tokens,
-        cost_usd=round(cost + rag.embedding_cost(embedding_tokens), 8),
+        cost_usd=round(cost + rag.embedding_cost(embedding_tokens) + rag.rerank_cost(rerank_units), 8),
     )
 
 
@@ -293,23 +311,40 @@ def debug_retrieve(
     request: Request,
     q: str = Query(..., max_length=4000),
     top_k: int = Query(5, ge=1, le=20),
+    rerank: Optional[bool] = Query(None),
     x_app_token: Optional[str] = Header(None),
 ):
-    """Show which chunks a question retrieves, with similarity scores. Never calls Claude."""
+    """Show which chunks a question retrieves, with similarity scores. Never calls Claude.
+
+    rerank defaults to the server's RERANK setting. With rerank=true, each match also has
+    rerank_score and vector_rank, so you can see how far the reranker moved it.
+    Unlike /ask, a rerank failure is reported as an error here, not hidden by a fallback.
+    """
     check_access(x_app_token, force_bad=False)
     question = q.strip()
     if not question:
         raise HTTPException(status_code=400, detail="q must not be empty.")
+    use_rerank = rag.RERANK if rerank is None else rerank
 
+    units = 0
     with rag_errors():
-        matches, tokens = rag.query(question, top_k=top_k)
-    return {
+        if use_rerank:
+            candidates, tokens = rag.query(question, top_k=max(rag.RERANK_CANDIDATES, top_k))
+            matches, units = rag.rerank(question, candidates, top_n=top_k)
+        else:
+            matches, tokens = rag.query(question, top_k=top_k)
+    response = {
         "query": question,
         "top_k": top_k,
+        "rerank": use_rerank,
         "matches": matches,
         "tokens_used": tokens,
-        "cost_usd": round(rag.embedding_cost(tokens), 8),
+        "cost_usd": round(rag.embedding_cost(tokens) + rag.rerank_cost(units), 8),
     }
+    if use_rerank:
+        response["rerank_candidates"] = len(candidates)
+        response["rerank_units"] = units
+    return response
 
 
 @app.get("/debug/pinecone")
@@ -367,7 +402,7 @@ def ask(request: Request, req: AskRequest, x_app_token: Optional[str] = Header(N
     # Checked after the rate limit, so wrong-token guessing is throttled too.
     check_access(x_app_token, req.force_bad)
 
-    chunks, embedding_tokens = retrieve(req.question)
+    chunks, embedding_tokens, rerank_units = retrieve(req.question)
     if not chunks:
         return no_context_response(embedding_tokens)
 
@@ -378,7 +413,7 @@ def ask(request: Request, req: AskRequest, x_app_token: Optional[str] = Header(N
             system=system_prompt(req.force_bad),
             messages=[{"role": "user", "content": grounding_prompt(req.question, chunks)}],
         )
-    return build_response(response, chunks, embedding_tokens)
+    return build_response(response, chunks, embedding_tokens, rerank_units)
 
 
 @app.post("/ask/stream")
@@ -392,7 +427,7 @@ def ask_stream(request: Request, req: AskRequest, x_app_token: Optional[str] = H
     """
     check_access(x_app_token, req.force_bad)
 
-    chunks, embedding_tokens = retrieve(req.question)
+    chunks, embedding_tokens, rerank_units = retrieve(req.question)
     if not chunks:
         done = sse("done", no_context_response(embedding_tokens).model_dump())
         return StreamingResponse(iter([done]), media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
@@ -425,7 +460,7 @@ def ask_stream(request: Request, req: AskRequest, x_app_token: Optional[str] = H
             manager.__exit__(None, None, None)
 
         try:
-            yield sse("done", build_response(final, chunks, embedding_tokens).model_dump())
+            yield sse("done", build_response(final, chunks, embedding_tokens, rerank_units).model_dump())
         except HTTPException as e:
             yield sse("error", {"status": e.status_code, "detail": e.detail})
 
